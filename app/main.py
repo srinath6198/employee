@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
-from pymongo.errors import ConfigurationError, ConnectionFailure, DuplicateKeyError
+from pymongo.errors import ConfigurationError, ConnectionFailure, DuplicateKeyError, PyMongoError
 from starlette.responses import JSONResponse
 
 load_dotenv()
@@ -71,9 +71,24 @@ def ensure_indexes() -> None:
 async def lifespan(app: FastAPI):
     del app
     try:
-        ensure_indexes()
-    except (ConnectionFailure, ConfigurationError):
-        logger.exception("MongoDB unavailable while creating indexes; requests will return 503")
+        client.admin.command("ping")
+    except PyMongoError as exc:
+        logger.error(
+            "MongoDB NOT CONNECTED: %s: %s",
+            type(exc).__name__,
+            str(exc).splitlines()[0],
+        )
+    else:
+        try:
+            ensure_indexes()
+        except PyMongoError as exc:
+            logger.error(
+                "MongoDB connected, but index setup failed: %s: %s",
+                type(exc).__name__,
+                str(exc).splitlines()[0],
+            )
+        else:
+            logger.info("MongoDB CONNECTED (database=%s)", db.name)
     yield
 
 
@@ -90,14 +105,22 @@ async def mongo_unavailable_handler(
     request: Request, exc: ConnectionFailure | ConfigurationError
 ) -> JSONResponse:
     logger.warning("MongoDB unavailable during %s %s: %s", request.method, request.url.path, exc)
+    if isinstance(exc, ConfigurationError):
+        if "reports wire version" in str(exc):
+            detail = (
+                "The MongoDB server version is incompatible with this application. "
+                "Upgrade MongoDB to version 6.0 or newer."
+            )
+        else:
+            detail = "MongoDB configuration error. Check MONGO_URI and the MongoDB server version."
+    else:
+        detail = (
+            "MongoDB is unavailable. Check that the server is running and that MONGO_URI "
+            "points to the correct address."
+        )
     return JSONResponse(
         status_code=503,
-        content={
-            "detail": (
-                "MongoDB is unavailable. Check Atlas cluster status, Network Access "
-                "allowlist, and TLS connectivity."
-            )
-        },
+        content={"detail": detail},
     )
 
 
